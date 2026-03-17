@@ -100,14 +100,31 @@ re-traces the entire model. Set to 128 to prevent this.
 
 ## Docker Version History
 
+### rocm/sgl-dev (SGLang)
+
+Tag pattern: `v{sglang}-rocm{rocm}-mi{arch}-{YYYYMMDD}`
+
 | Docker Tag | Known Defaults | Notes |
 |------------|---------------|-------|
 | `rocm/sgl-dev:v0.5.8-rocm700-mi30x-20260129` | `max_autotune=True` | hipBLASLt solver bug present |
 | `rocm/sgl-dev:v0.5.8-rocm700-mi35x-20260210` | `max_autotune=True` | hipBLASLt solver bug, FP8 flash attn broken |
 | `rocm/sgl-dev:v0.5.8.post1-rocm700-mi35x-20260219` | TBD (run env_probe.py) | May have fixes |
+| `rocm/sgl-dev:v0.5.9-rocm700-mi30x-YYYYMMDD` | TBD | SGLang 0.5.9, ROCm 7.0.0, MI300X |
+| `rocm/sgl-dev:v0.5.9-rocm700-mi35x-YYYYMMDD` | TBD | SGLang 0.5.9, ROCm 7.0.0, MI355X |
+| `rocm/sgl-dev:v0.5.9-rocm720-mi30x-YYYYMMDD` | TBD | SGLang 0.5.9, ROCm 7.2.0, MI300X |
+| `rocm/sgl-dev:v0.5.9-rocm720-mi35x-YYYYMMDD` | TBD | SGLang 0.5.9, ROCm 7.2.0, MI355X |
+
+### rocm/vllm (vLLM)
+
+| Docker Tag | Known Defaults | Notes |
+|------------|---------------|-------|
+| `rocm/vllm:v0.14.0_amd_dev` | TBD | Latest amd_dev branch |
+| `rocm/vllm:latest` (= `rocm7.0.0_vllm_0.11.2_20251210`) | TBD | ROCm 7.0.0, vLLM 0.11.2 |
+| `rocm/vllm:rocm7.0.0_vllm_0.11.1_20251103` | TBD | ROCm 7.0.0, vLLM 0.11.1 |
 
 This table should be updated as new Docker versions are tested. Run `env_probe.py` in each
-new Docker and record the findings.
+new Docker and record the findings. Daily builds of `rocm/sgl-dev` can differ in behavior
+even for the same SGLang/ROCm version — always check the date stamp.
 
 ## Environment Variable Overrides
 

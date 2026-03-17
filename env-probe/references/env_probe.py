@@ -16,9 +16,11 @@ No dependencies beyond PyTorch (which your AMD Docker already has).
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
-import importlib
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import Optional
 
 
@@ -46,6 +48,201 @@ findings: list[Finding] = []
 
 def add(severity, category, title, detail, fix=None):
     findings.append(Finding(severity, category, title, detail, fix))
+
+
+# ─── Category 0: Docker Container Identity ─────────────────────────────────
+
+def _read_file_safe(path: str, strip: bool = True) -> Optional[str]:
+    try:
+        text = Path(path).read_text()
+        return text.strip() if strip else text
+    except (OSError, PermissionError):
+        return None
+
+
+def check_docker_container():
+    """Detect if running inside Docker and identify the container."""
+    in_docker = (
+        Path("/.dockerenv").exists()
+        or _read_file_safe("/proc/1/cgroup") is not None
+        and "docker" in (_read_file_safe("/proc/1/cgroup") or "")
+    )
+
+    if not in_docker:
+        cgroup = _read_file_safe("/proc/self/cgroup") or ""
+        if "docker" in cgroup or "containerd" in cgroup or "/lxc/" in cgroup:
+            in_docker = True
+
+    if in_docker:
+        add("INFO", "docker", "Running inside Docker", "Container environment detected")
+    else:
+        add("INFO", "docker", "Not a Docker container",
+            "Running on bare metal or undetected container runtime")
+        return
+
+    hostname = os.environ.get("HOSTNAME", "")
+    if hostname:
+        add("INFO", "docker", "Container hostname", hostname)
+
+
+def check_docker_image_tag():
+    """Best-effort detection of the Docker image tag.
+
+    AMD Docker images embed metadata in env vars or label files.
+    We also parse known naming conventions from rocm/vllm and rocm/sgl-dev.
+    """
+    image_candidates = []
+
+    for var in ("DOCKER_IMAGE", "IMAGE_NAME", "BASE_IMAGE",
+                "CONTAINER_IMAGE", "NVIDIA_VISIBLE_DEVICES_COMPAT_IMAGE"):
+        val = os.environ.get(var)
+        if val:
+            image_candidates.append((var, val))
+
+    label_file = _read_file_safe("/image_label.txt")
+    if label_file:
+        image_candidates.append(("label_file", label_file))
+
+    proc_env = _read_file_safe("/proc/1/environ")
+    if proc_env:
+        for env_entry in proc_env.split("\x00"):
+            if "=" in env_entry:
+                k, v = env_entry.split("=", 1)
+                if k in ("DOCKER_IMAGE", "IMAGE_NAME", "BASE_IMAGE"):
+                    image_candidates.append((k, v))
+
+    if image_candidates:
+        for source, tag in image_candidates:
+            add("INFO", "docker", f"Docker image ({source})", tag)
+    else:
+        add("INFO", "docker", "Docker image tag",
+            "Not detected via env vars. Check 'docker inspect' from host.")
+
+
+def check_rocm_version():
+    """Detect ROCm version from filesystem and tools."""
+    version = None
+
+    for path in ("/opt/rocm/.info/version", "/opt/rocm/.info/version-dev"):
+        v = _read_file_safe(path)
+        if v:
+            version = v
+            break
+
+    if not version:
+        rocm_path = os.environ.get("ROCM_PATH", "/opt/rocm")
+        v = _read_file_safe(f"{rocm_path}/.info/version")
+        if v:
+            version = v
+
+    if not version:
+        try:
+            result = subprocess.run(
+                ["apt", "list", "--installed"],
+                capture_output=True, text=True, timeout=10,
+            )
+            for line in result.stdout.split("\n"):
+                if "rocm-dev" in line or "rocm-libs" in line:
+                    m = re.search(r"(\d+\.\d+\.\d+)", line)
+                    if m:
+                        version = m.group(1)
+                        break
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    if version:
+        add("INFO", "docker", "ROCm version", version)
+    else:
+        add("WARNING", "docker", "ROCm version not detected",
+            "Could not find ROCm version in /opt/rocm/.info/ or apt packages")
+
+
+def check_serving_framework():
+    """Detect vLLM / SGLang and their versions — critical for knowing which
+    Docker image family (rocm/vllm vs rocm/sgl-dev) is active."""
+    frameworks_found = []
+
+    # vLLM
+    try:
+        import vllm
+        ver = getattr(vllm, "__version__", "unknown")
+        add("INFO", "docker", "vLLM version", f"{ver}")
+        frameworks_found.append(f"vllm=={ver}")
+    except ImportError:
+        pass
+
+    # SGLang
+    try:
+        import sglang
+        ver = getattr(sglang, "__version__", "unknown")
+        add("INFO", "docker", "SGLang version", f"{ver}")
+        frameworks_found.append(f"sglang=={ver}")
+    except ImportError:
+        pass
+
+    if not frameworks_found:
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "show", "vllm", "sglang"],
+                capture_output=True, text=True, timeout=15,
+            )
+            for line in result.stdout.split("\n"):
+                if line.startswith("Name:"):
+                    name = line.split(":", 1)[1].strip()
+                if line.startswith("Version:"):
+                    ver = line.split(":", 1)[1].strip()
+                    frameworks_found.append(f"{name}=={ver}")
+                    add("INFO", "docker", f"{name} version (pip)", ver)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    if not frameworks_found:
+        add("INFO", "docker", "Serving framework",
+            "Neither vLLM nor SGLang detected")
+
+    return frameworks_found
+
+
+def check_docker_image_summary():
+    """Synthesize a human-readable image identity string from all gathered info.
+
+    Produces something like:
+      rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260317
+      rocm/vllm:v0.14.0_amd_dev (ROCm 7.0.0)
+    """
+    rocm_ver = None
+    sglang_ver = None
+    vllm_ver = None
+    gfx = None
+
+    for f in findings:
+        if f.category != "docker":
+            continue
+        if "ROCm version" in f.title:
+            rocm_ver = f.detail
+        if "SGLang version" in f.title:
+            sglang_ver = f.detail
+        if "vLLM version" in f.title:
+            vllm_ver = f.detail
+
+    for f in findings:
+        if "GFX targets" in f.title:
+            gfx = f.detail
+
+    parts = []
+    if sglang_ver:
+        parts.append(f"SGLang {sglang_ver}")
+    if vllm_ver:
+        parts.append(f"vLLM {vllm_ver}")
+    if rocm_ver:
+        parts.append(f"ROCm {rocm_ver}")
+    if gfx:
+        parts.append(f"GPU arch: {gfx}")
+
+    if parts:
+        add("INFO", "docker", "Environment summary", " | ".join(parts))
+    else:
+        add("INFO", "docker", "Environment summary", "Could not determine image identity")
 
 
 # ─── Category 1: Surface Facts ─────────────────────────────────────────────
@@ -88,7 +285,6 @@ def check_triton():
 
 
 def check_rocm_hardware():
-    import subprocess
     # rocm-smi
     try:
         result = subprocess.run(["rocm-smi", "--showproductname"],
@@ -452,6 +648,12 @@ def check_env_vars():
 # ─── Runner ─────────────────────────────────────────────────────────────────
 
 def run_all_checks():
+    # Category 0: Docker container identity
+    check_docker_container()
+    check_docker_image_tag()
+    check_rocm_version()
+    check_serving_framework()
+
     # Category 1: Surface
     check_python()
     check_pytorch()
@@ -474,16 +676,30 @@ def run_all_checks():
     # Category 4: Environment variables
     check_env_vars()
 
+    # Summary (runs last, reads earlier findings)
+    check_docker_image_summary()
+
 
 def print_report():
     criticals = [f for f in findings if f.severity == "CRITICAL"]
     warnings = [f for f in findings if f.severity == "WARNING"]
     infos = [f for f in findings if f.severity == "INFO"]
 
+    docker_findings = [f for f in findings if f.category == "docker"]
+
     print("=" * 72)
     print("  AMD/ROCm Docker Environment Probe Report")
     print("=" * 72)
     print()
+
+    if docker_findings:
+        print("-" * 72)
+        print("  DOCKER / IMAGE IDENTITY")
+        print("-" * 72)
+        for f in docker_findings:
+            print()
+            print(f)
+        print()
 
     if criticals:
         print(f"  CRITICAL issues: {len(criticals)} (MUST fix before proceeding)")
@@ -492,29 +708,33 @@ def print_report():
     print(f"  Info:            {len(infos)}")
     print()
 
-    if criticals:
+    non_docker_criticals = [f for f in criticals if f.category != "docker"]
+    non_docker_warnings = [f for f in warnings if f.category != "docker"]
+    non_docker_infos = [f for f in infos if f.category != "docker"]
+
+    if non_docker_criticals:
         print("-" * 72)
         print("  CRITICAL — Fix these before writing any code")
         print("-" * 72)
-        for f in criticals:
+        for f in non_docker_criticals:
             print()
             print(f)
         print()
 
-    if warnings:
+    if non_docker_warnings:
         print("-" * 72)
         print("  WARNINGS — Fix before benchmarking")
         print("-" * 72)
-        for f in warnings:
+        for f in non_docker_warnings:
             print()
             print(f)
         print()
 
-    if infos:
+    if non_docker_infos:
         print("-" * 72)
         print("  INFO — Environment state")
         print("-" * 72)
-        for f in infos:
+        for f in non_docker_infos:
             print()
             print(f)
         print()

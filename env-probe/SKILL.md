@@ -2,11 +2,12 @@
 name: env-probe
 description: >
   Inspect AMD/ROCm Docker runtime environment before writing any code. Use BEFORE torch.compile,
-  CUDAGraph capture, or any kernel optimization. Detects hidden framework defaults (inductor
+  CUDAGraph capture, or any kernel optimization. Identifies the Docker image (rocm/vllm, rocm/sgl-dev
+  tags with date stamps), detects ROCm/vLLM/SGLang versions, hidden framework defaults (inductor
   max_autotune, triton.cudagraphs), known Docker-specific bugs (hipBLASLt solver crash, FP8
   flash attn), and missing packages. Outputs CRITICAL/WARNING/INFO report with recommended fixes.
   Triggered by: starting work in an AMD Docker, "check environment", "why is torch.compile hanging",
-  "env probe", Phase 0 of any AMD optimization experiment.
+  "env probe", "what Docker am I in", Phase 0 of any AMD optimization experiment.
 ---
 
 # AMD/ROCm Docker Environment Probe
@@ -17,13 +18,32 @@ are impossible to diagnose by looking at code alone.
 
 ## Why This Exists
 
-Problem: ROCm Docker images override PyTorch/Triton defaults at the system level. For example,
-`max_autotune=True` as a global default means `torch.compile(mode="default")` benchmarks every
-GEMM across ATEN+TRITON+CPP backends. With hundreds of matmuls in a compiled graph, autotuning
-never finishes — the process hangs indefinitely with no error message.
+Two problems this solves:
 
-These defaults are invisible to `pip list`, `rocm-smi`, or any surface-level inspection. You have
-to introspect the framework config objects at runtime to see them.
+1. **Image identity**: We frequently switch between Docker images from `rocm/vllm` and
+   `rocm/sgl-dev` (see [Docker Hub: rocm/vllm](https://hub.docker.com/r/rocm/vllm/tags),
+   [Docker Hub: rocm/sgl-dev](https://hub.docker.com/r/rocm/sgl-dev/tags)). Tags include date
+   stamps (e.g., `v0.5.9-rocm720-mi35x-20260317`) and the exact combination of ROCm version,
+   GPU architecture target, and framework version changes constantly. The probe tells you exactly
+   which environment you are in.
+
+2. **Hidden defaults**: ROCm Docker images override PyTorch/Triton defaults at the system level.
+   For example, `max_autotune=True` as a global default means `torch.compile(mode="default")`
+   benchmarks every GEMM across ATEN+TRITON+CPP backends. These are invisible to `pip list` or
+   `rocm-smi`.
+
+## Known Docker Image Families
+
+| Image | Hub | Typical tag pattern | Contents |
+|-------|-----|---------------------|----------|
+| `rocm/vllm` | [tags](https://hub.docker.com/r/rocm/vllm/tags) | `v0.14.0_amd_dev`, `rocm7.0.0_vllm_0.11.2_YYYYMMDD` | vLLM + ROCm + PyTorch |
+| `rocm/sgl-dev` | [tags](https://hub.docker.com/r/rocm/sgl-dev/tags) | `v0.5.9-rocm720-mi35x-YYYYMMDD`, `v0.5.9-rocm700-mi30x-YYYYMMDD` | SGLang + ROCm + PyTorch |
+
+Tag naming conventions for `rocm/sgl-dev`:
+- `v{sglang_version}-rocm{rocm_version}-mi{gpu_arch}-{date}`
+- `rocm720` = ROCm 7.2.0, `rocm700` = ROCm 7.0.0
+- `mi35x` = MI355X (gfx950), `mi30x` = MI300X (gfx942)
+- Date stamp `YYYYMMDD` identifies the build — behavior can differ between daily builds
 
 ## How to Use
 
@@ -33,14 +53,13 @@ to introspect the framework config objects at runtime to see them.
 python /path/to/env_probe.py
 ```
 
-Or if the skill is installed as a Claude Code command, copy the probe script from
-[references/env_probe.py](references/env_probe.py) and run it inside your Docker container.
-
-The probe script is self-contained — no dependencies beyond PyTorch (which your Docker already has).
+Or copy the probe script from [references/env_probe.py](references/env_probe.py) and run it
+inside your Docker container. Self-contained — no deps beyond PyTorch.
 
 ### Step 2: Read the output
 
-The probe outputs a structured report with three severity levels:
+The report starts with **Docker / Image Identity** (ROCm version, vLLM/SGLang version, GPU arch),
+then shows issues by severity:
 
 | Level | Meaning | Action |
 |-------|---------|--------|
@@ -50,15 +69,22 @@ The probe outputs a structured report with three severity levels:
 
 ### Step 3: Apply fixes
 
-Each CRITICAL/WARNING item includes a recommended fix — either a Python config line or an
-environment variable to set. Apply these fixes at the top of your script, before any
-`torch.compile()` or `torch.cuda.CUDAGraph()` call.
+Each CRITICAL/WARNING item includes a recommended fix. Apply at the top of your script, before
+any `torch.compile()` or `torch.cuda.CUDAGraph()` call.
 
 ## What the Probe Checks
 
+### Category 0: Docker Container Identity (NEW)
+- Whether running inside Docker
+- Docker image tag (from env vars, label files, `/proc/1/environ`)
+- ROCm version (from `/opt/rocm/.info/version`)
+- vLLM version (import or pip)
+- SGLang version (import or pip)
+- Synthesized environment summary line
+
 ### Category 1: Surface Facts (versions, hardware)
 - Python version, PyTorch version, Triton version
-- ROCm version, GPU architecture (gfx target)
+- GPU architecture (gfx target from rocminfo)
 - AITER, Composable Kernel, flash-attn availability and versions
 - hipBLASLt availability
 
@@ -113,8 +139,8 @@ explanation of each setting and when you might want to override them.
 ## Integration with Other Skills
 
 - **amd-rocm-porting**: Run env-probe as Phase 0.5 (after Phase 0 environment setup, before Phase 1 porting)
-- **amd-inference-optimization**: Run env-probe before Phase 0 profiling baseline
-- **rocprofv3-profiler**: Probe checks that rocprofv3 is available and functional
+- **amd-kernel-optimization**: Run env-probe before profiling baseline
+- **gpu-profiling**: Probe checks that rocprofv3 is available and functional
 
 ## Adding New Checks
 

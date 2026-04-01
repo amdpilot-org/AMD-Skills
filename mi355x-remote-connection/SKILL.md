@@ -77,7 +77,7 @@ rocm-smi --showpids 2>/dev/null || rocm-smi --showuse
 | Check | Healthy | Action if unhealthy |
 |-------|---------|---------------------|
 | `gfx950` in rocminfo | Yes | Wrong node — do not proceed |
-| All 8 GPUs visible | Yes | Check HIP_VISIBLE_DEVICES, container config |
+| All 8 GPUs visible | Yes | Check node health, rocm-smi/driver status, confirm you're on host (not inside container) |
 | GPU temp < 90C | Yes | Wait for cooldown or check cooling |
 | `/data` > 100GB free | Yes | Clean old experiment artifacts |
 | No zombie containers | Yes | `docker rm -f <name>` if stale |
